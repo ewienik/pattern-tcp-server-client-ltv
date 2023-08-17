@@ -1,0 +1,11 @@
+[package]
+name = "pattern-tcp-server-client-ltv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "*"
+bytes = "*"
+futures = "*"
+tokio = { version = "*", features = ["full"] }
+tokio-util = { version = "*", features = ["codec"] }
