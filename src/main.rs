@@ -1,6 +1,7 @@
 use {
-    crate::proto::{Packet, ProtoDeserialize},
+    crate::proto::Packet,
     anyhow::anyhow,
+    bytes::BytesMut,
     futures::{Sink, SinkExt, Stream, StreamExt},
     tokio::{
         io::{AsyncRead, AsyncWrite},
@@ -12,107 +13,199 @@ use {
 mod proto {
     use {
         anyhow::bail,
-        bytes::{Buf, BufMut, Bytes, BytesMut},
+        bytes::{Buf, BufMut, BytesMut},
     };
 
-    #[derive(Debug)]
-    pub enum Packet {
-        Request { left: u16, right: u16 },
-        Response { value: u16 },
+    const HEADER_SIZE: usize = 3;
+    const PAYLOAD_OFFSET: usize = HEADER_SIZE;
+
+    const REQUEST_SIZE: u16 = 7;
+    const REQUEST_TYPE: u8 = 1;
+    const REQUEST_OFFSET_LEFT: usize = PAYLOAD_OFFSET;
+    const REQUEST_OFFSET_RIGHT: usize = REQUEST_OFFSET_LEFT + 2;
+
+    const RESPONSE_SIZE: u16 = 5;
+    const RESPONSE_TYPE: u8 = 2;
+    const RESPONSE_OFFSET_VALUE: usize = PAYLOAD_OFFSET;
+
+    fn header(mut buf: &[u8]) -> anyhow::Result<(u16, u8)> {
+        let remaining = buf.len();
+        if HEADER_SIZE > remaining {
+            bail!(
+                "too small buffer for Packet Header: expected {HEADER_SIZE}, provided {remaining}"
+            );
+        };
+        let pkt_size = buf.get_u16_le();
+        if pkt_size as usize > remaining {
+            bail!("too small Packet size: expected {pkt_size}, provided {remaining}");
+        };
+        Ok((pkt_size, buf.get_u8()))
     }
 
-    pub trait ProtoSize {
-        fn proto_size(&self) -> usize;
+    pub struct Request<T> {
+        inner: T,
     }
 
-    pub trait ProtoSerialize<T> {
-        fn proto_serialize(&self, dst: T) -> anyhow::Result<()>;
+    impl<T> Request<T> {
+        pub fn into_inner(self) -> T {
+            self.inner
+        }
     }
 
-    pub trait ProtoDeserialize<T>: Sized {
-        fn proto_deserialize(dst: T) -> anyhow::Result<Self>;
+    impl<T: AsRef<[u8]>> Request<T> {
+        pub fn view(inner: T) -> anyhow::Result<Self> {
+            let (pkt_size, pkt_type) = header(inner.as_ref())?;
+            if REQUEST_SIZE != pkt_size {
+                bail!("wrong packet size Request: expected {REQUEST_SIZE}, provided {pkt_size}");
+            };
+            if REQUEST_TYPE != pkt_type {
+                bail!("wrong packet type Request: expected {REQUEST_TYPE}, provided {pkt_type}");
+            };
+            Ok(Self { inner })
+        }
+
+        pub fn pkt_size(&self) -> u16 {
+            REQUEST_SIZE
+        }
+
+        pub fn left(&self) -> u16 {
+            (&(self.inner.as_ref()[REQUEST_OFFSET_LEFT..])).get_u16_le()
+        }
+
+        pub fn right(&self) -> u16 {
+            (&(self.inner.as_ref()[REQUEST_OFFSET_RIGHT..])).get_u16_le()
+        }
     }
 
-    impl ProtoSize for Packet {
-        fn proto_size(&self) -> usize {
-            match self {
-                Self::Request { .. } => Self::REQUEST_SIZE,
-                Self::Response { .. } => Self::RESPONSE_SIZE,
+    impl Request<BytesMut> {
+        pub fn new(inner: &mut BytesMut, left: u16, right: u16) -> Self {
+            assert!(inner.is_empty());
+            inner.put_request(left, right);
+            Self {
+                inner: inner.split(),
             }
         }
     }
 
-    impl<T: AsMut<[u8]>> ProtoSerialize<T> for Packet {
-        fn proto_serialize(&self, mut dst: T) -> anyhow::Result<()> {
-            let mut dst = dst.as_mut();
-            let pkt_size = self.proto_size();
-            if pkt_size > dst.len() {
-                bail!(
-                    "too small dst: required {pkt_size}, remaining {}",
-                    dst.len()
-                );
-            }
-            dst.put_u16_le(pkt_size as u16);
-            match self {
-                Packet::Request { left, right } => {
-                    dst.put_u8(Self::REQUEST_TYPE);
-                    dst.put_u16_le(*left);
-                    dst.put_u16_le(*right);
-                }
-                Packet::Response { value } => {
-                    dst.put_u8(Self::RESPONSE_TYPE);
-                    dst.put_u16_le(*value);
-                }
-            }
-            Ok(())
-        }
-    }
+    impl TryFrom<BytesMut> for Request<BytesMut> {
+        type Error = anyhow::Error;
 
-    impl<T: AsRef<[u8]>> ProtoDeserialize<T> for Packet {
-        fn proto_deserialize(src: T) -> anyhow::Result<Self> {
-            let mut src = src.as_ref();
-            let remaining = src.len();
-            if Packet::HEADER_SIZE > remaining {
-                bail!(
-                    "too small Buf for header: required {}, remaining {remaining}",
-                    Packet::HEADER_SIZE,
-                );
-            };
-            let pkt_size = src.get_u16_le();
-            if pkt_size as usize > remaining {
-                bail!("too small Buf for packet: required {pkt_size}, remaining {remaining}",);
-            };
-            Ok(match src.get_u8() {
-                Self::REQUEST_TYPE => Packet::Request {
-                    left: src.get_u16_le(),
-                    right: src.get_u16_le(),
-                },
-                Self::RESPONSE_TYPE => Packet::Response {
-                    value: src.get_u16_le(),
-                },
-                pkt_type => bail!("unknown packet type {pkt_type}"),
+        fn try_from(mut inner: BytesMut) -> anyhow::Result<Self> {
+            let view = Request::view(&inner)?;
+            Ok(Self {
+                inner: inner.split_to(view.pkt_size() as usize),
             })
         }
     }
 
-    impl Packet {
-        pub const HEADER_SIZE: usize = 3;
+    pub struct Response<T> {
+        inner: T,
+    }
 
-        pub const REQUEST_SIZE: usize = 7;
-        pub const REQUEST_TYPE: u8 = 1;
+    impl<T> Response<T> {
+        pub fn into_inner(self) -> T {
+            self.inner
+        }
+    }
 
-        pub const RESPONSE_SIZE: usize = 5;
-        pub const RESPONSE_TYPE: u8 = 2;
+    impl<T: AsRef<[u8]>> Response<T> {
+        pub fn view(inner: T) -> anyhow::Result<Self> {
+            let (pkt_size, pkt_type) = header(inner.as_ref())?;
+            if RESPONSE_SIZE != pkt_size {
+                bail!("wrong packet size Response: expected {RESPONSE_SIZE}, provided {pkt_size}");
+            };
+            if RESPONSE_TYPE != pkt_type {
+                bail!("wrong packet type Response: expected {RESPONSE_TYPE}, provided {pkt_type}");
+            };
+            Ok(Self { inner })
+        }
 
-        pub fn to_bytes(&self) -> anyhow::Result<Bytes> {
-            let mut buf = BytesMut::zeroed(self.proto_size());
-            self.proto_serialize(&mut buf)?;
-            Ok(buf.into())
+        pub fn pkt_size(&self) -> u16 {
+            RESPONSE_SIZE
+        }
+
+        pub fn value(&self) -> u16 {
+            (&(self.inner.as_ref()[RESPONSE_OFFSET_VALUE..])).get_u16_le()
+        }
+    }
+
+    impl Response<BytesMut> {
+        pub fn new(inner: &mut BytesMut, value: u16) -> Self {
+            assert!(inner.is_empty());
+            inner.put_response(value);
+            Self {
+                inner: inner.split(),
+            }
+        }
+    }
+
+    impl TryFrom<BytesMut> for Response<BytesMut> {
+        type Error = anyhow::Error;
+
+        fn try_from(mut inner: BytesMut) -> anyhow::Result<Self> {
+            let view = Response::view(&inner)?;
+            Ok(Self {
+                inner: inner.split_to(view.pkt_size() as usize),
+            })
+        }
+    }
+
+    pub trait BufMutExt: BufMut + Sized {
+        fn put_request(&mut self, left: u16, right: u16) {
+            self.put_u16_le(REQUEST_SIZE);
+            self.put_u8(REQUEST_TYPE);
+            self.put_u16_le(left);
+            self.put_u16_le(right);
+        }
+
+        fn put_response(&mut self, value: u16) {
+            self.put_u16_le(RESPONSE_SIZE);
+            self.put_u8(RESPONSE_TYPE);
+            self.put_u16_le(value);
+        }
+    }
+
+    impl BufMutExt for BytesMut {}
+
+    pub enum Packet<T> {
+        Request(Request<T>),
+        Response(Response<T>),
+    }
+
+    impl<T> Packet<T> {
+        pub fn into_inner(self) -> T {
+            match self {
+                Self::Request(request) => request.into_inner(),
+                Self::Response(response) => response.into_inner(),
+            }
+        }
+    }
+
+    impl Packet<BytesMut> {
+        pub fn new_request(inner: &mut BytesMut, left: u16, right: u16) -> Self {
+            Self::Request(Request::new(inner, left, right))
+        }
+        pub fn new_response(inner: &mut BytesMut, value: u16) -> Self {
+            Self::Response(Response::new(inner, value))
+        }
+    }
+
+    impl TryFrom<BytesMut> for Packet<BytesMut> {
+        type Error = anyhow::Error;
+
+        fn try_from(inner: BytesMut) -> anyhow::Result<Self> {
+            if let Ok(request) = Request::try_from(inner.clone()) {
+                return Ok(Self::Request(request));
+            };
+            if let Ok(response) = Response::try_from(inner) {
+                return Ok(Self::Response(response));
+            };
+            bail!("Unknown packet");
         }
     }
 }
 
-fn wrap_with_decoder<T: AsyncRead>(io: T) -> impl Stream<Item = anyhow::Result<Packet>> {
+fn wrap_with_decoder<T: AsyncRead>(io: T) -> impl Stream<Item = anyhow::Result<Packet<BytesMut>>> {
     LengthDelimitedCodec::builder()
         .little_endian()
         .length_field_offset(0)
@@ -120,10 +213,10 @@ fn wrap_with_decoder<T: AsyncRead>(io: T) -> impl Stream<Item = anyhow::Result<P
         .length_adjustment(0)
         .num_skip(0)
         .new_read(io)
-        .map(|buf| Packet::proto_deserialize(buf?))
+        .map(|inner| Packet::try_from(inner?))
 }
 
-fn wrap_with_encoder<T: AsyncWrite>(io: T) -> impl Sink<Packet> + Unpin {
+fn wrap_with_encoder<T: AsyncWrite>(io: T) -> impl Sink<Packet<BytesMut>> + Unpin {
     Box::pin(
         LengthDelimitedCodec::builder()
             .little_endian()
@@ -131,7 +224,9 @@ fn wrap_with_encoder<T: AsyncWrite>(io: T) -> impl Sink<Packet> + Unpin {
             .length_field_type::<u16>()
             .length_adjustment(-2)
             .new_write(io)
-            .with(|pkt: Packet| async move { pkt.to_bytes().map(|buf| buf.slice(2..)) }),
+            .with(|pkt: Packet<BytesMut>| async move {
+                anyhow::Ok(pkt.into_inner().split_off(2).freeze())
+            }),
     )
 }
 
@@ -144,12 +239,14 @@ async fn main() {
         let (read, write) = socket.split();
         let mut sink = wrap_with_encoder(write);
         let mut stream = wrap_with_decoder(read);
-        let Packet::Request { left, right } = stream.next().await.unwrap().unwrap() else {
+        let Packet::Request(request) = stream.next().await.unwrap().unwrap() else {
             unreachable!();
         };
-        sink.send(Packet::Response {
-            value: left + right,
-        })
+        let mut buf = BytesMut::new();
+        sink.send(Packet::new_response(
+            &mut buf,
+            request.left() + request.right(),
+        ))
         .await
         .map_err(|_| anyhow!("unable to send by server"))
         .unwrap();
@@ -158,16 +255,14 @@ async fn main() {
     let (read, write) = client.split();
     let mut sink = wrap_with_encoder(write);
     let mut stream = wrap_with_decoder(read);
-    sink.send(Packet::Request {
-        left: 100,
-        right: 200,
-    })
-    .await
-    .map_err(|_| anyhow!("unable to send by client"))
-    .unwrap();
-    let Packet::Response { value } = stream.next().await.unwrap().unwrap() else {
+    let mut buf = BytesMut::new();
+    sink.send(Packet::new_request(&mut buf, 100, 200))
+        .await
+        .map_err(|_| anyhow!("unable to send by client"))
+        .unwrap();
+    let Packet::Response(response) = stream.next().await.unwrap().unwrap() else {
         unreachable!();
     };
-    assert_eq!(value, 300);
+    assert_eq!(response.value(), 300);
     server_join.await.unwrap();
 }
